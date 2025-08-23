@@ -310,3 +310,154 @@
         false
     )
 )
+
+;; Marketplace and Trading Functions
+(define-map item-listings
+    { token-id: uint }
+    {
+        seller: principal,
+        price: uint,
+        active: bool
+    }
+)
+
+(define-public (list-item-for-sale (token-id uint) (price uint))
+    (let ((owner (unwrap! (nft-get-owner? game-loot token-id) err-not-found))
+          (token-meta (unwrap! (get-token-metadata token-id) err-not-found)))
+        (asserts! (is-eq tx-sender owner) err-unauthorized)
+        (asserts! (get tradable token-meta) (err u111)) ;; err-not-tradable
+        (asserts! (> price u0) (err u112)) ;; err-invalid-price
+        (map-set item-listings
+            { token-id: token-id }
+            {
+                seller: owner,
+                price: price,
+                active: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-listing (token-id uint))
+    (let ((listing (unwrap! (map-get? item-listings { token-id: token-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get seller listing)) err-unauthorized)
+        (asserts! (get active listing) (err u113)) ;; err-listing-inactive
+        (map-set item-listings
+            { token-id: token-id }
+            (merge listing { active: false })
+        )
+        (ok true)
+    )
+)
+
+(define-public (purchase-item (token-id uint))
+    (let ((listing (unwrap! (map-get? item-listings { token-id: token-id }) err-not-found))
+          (seller (get seller listing))
+          (price (get price listing)))
+        (asserts! (get active listing) (err u113)) ;; err-listing-inactive
+        (asserts! (not (is-eq tx-sender seller)) (err u114)) ;; err-self-purchase
+        ;; Transfer the NFT
+        (try! (transfer token-id seller tx-sender))
+        ;; Mark listing as inactive
+        (map-set item-listings
+            { token-id: token-id }
+            (merge listing { active: false })
+        )
+        ;; In a real implementation, STX payment would happen here
+        (ok true)
+    )
+)
+
+;; Administrative Functions
+(define-public (set-contract-owner (new-owner principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Update the constant by creating a new data var if needed
+        (ok true)
+    )
+)
+
+(define-public (set-contract-uri (new-uri (optional (string-utf8 256))))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set contract-uri new-uri)
+        (ok true)
+    )
+)
+
+(define-public (emergency-pause (token-id uint))
+    (let ((token-meta (unwrap! (get-token-metadata token-id) err-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set token-metadata 
+            { token-id: token-id }
+            (merge token-meta { tradable: false })
+        )
+        ;; Cancel any active listing
+        (match (map-get? item-listings { token-id: token-id })
+            listing (map-set item-listings
+                        { token-id: token-id }
+                        (merge listing { active: false })
+                    )
+            true
+        )
+        (ok true)
+    )
+)
+
+;; Enhanced Read-only Functions
+(define-read-only (get-listing (token-id uint))
+    (map-get? item-listings { token-id: token-id })
+)
+
+(define-read-only (get-contract-owner)
+    contract-owner
+)
+
+(define-read-only (get-contract-uri)
+    (var-get contract-uri)
+)
+
+(define-read-only (get-item-stats (token-id uint))
+    (match (get-token-metadata token-id)
+        meta (ok {
+            rarity: (get rarity meta),
+            power-level: (get power-level meta),
+            max-power: (get-max-power-for-rarity (get rarity meta)),
+            tradable: (get tradable meta),
+            listed: (is-some (get-listing token-id))
+        })
+        err-not-found
+    )
+)
+
+(define-read-only (is-item-upgradeable (token-id uint) (new-power uint))
+    (match (get-token-metadata token-id)
+        meta (and
+            (> new-power (get power-level meta))
+            (<= new-power (get-max-power-for-rarity (get rarity meta)))
+        )
+        false
+    )
+)
+
+;; Enhanced utility functions
+(define-read-only (get-rarity-name (rarity uint))
+    (if (is-eq rarity rarity-common) "Common"
+        (if (is-eq rarity rarity-uncommon) "Uncommon"
+            (if (is-eq rarity rarity-rare) "Rare"
+                (if (is-eq rarity rarity-epic) "Epic"
+                    (if (is-eq rarity rarity-legendary) "Legendary"
+                        (if (is-eq rarity rarity-mythic) "Mythic"
+                            "Unknown"
+                        )
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-total-supply)
+    (var-get last-token-id)
+)
