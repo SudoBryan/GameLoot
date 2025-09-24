@@ -153,7 +153,7 @@
         (try! (nft-burn? game-loot token-id owner))
         (map-delete token-metadata { token-id: token-id })
         (map-delete token-owners { token-id: token-id })
-        (update-user-inventory owner (- u0 u1))
+        (decrease-user-inventory owner)
         (ok true)
     )
 )
@@ -190,9 +190,18 @@
     )
 )
 
+(define-private (decrease-user-inventory (user principal))
+    (let ((current-count (get-user-token-count user)))
+        (map-set user-inventory 
+            { user: user }
+            { token-count: (if (> current-count u0) (- current-count u1) u0) }
+        )
+    )
+)
+
 (define-private (update-inventory-on-transfer (sender principal) (recipient principal))
     (begin
-        (update-user-inventory sender (- u0 u1))
+        (decrease-user-inventory sender)
         (update-user-inventory recipient u1)
     )
 )
@@ -257,7 +266,7 @@
                 }
             )
             (map-set token-owners { token-id: new-token-id } { owner: owner-1 })
-            (update-user-inventory owner-1 (- u0 u1)) ;; Net decrease of 1 item (2 burned, 1 created)
+            (decrease-user-inventory owner-1) ;; Net decrease of 1 item (2 burned, 1 created)
             (ok new-token-id)
         )
     )

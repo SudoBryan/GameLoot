@@ -373,3 +373,443 @@ Clarinet.test({
         assertEquals(block.receipts[0].result, '"Unknown"');
     },
 });
+
+/**
+ * GameLoot NFT Contract Test Suite - Part 2: Transfer, Burn, and Item Management
+ * 
+ * This test suite covers:
+ * - NFT transfer functionality and validation
+ * - Item burning and cleanup
+ * - Item upgrade mechanics
+ * - Tradability controls
+ * - Item combination system
+ * - Inventory management during operations
+ */
+
+Clarinet.test({
+    name: "NFT transfer - successful transfer between users",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        const wallet2 = accounts.get("wallet_2")!;
+        
+        // First mint an item to wallet1
+        let block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Transferable Sword"),
+                types.utf8("A sword that can be transferred"),
+                types.utf8("https://example.com/transfersword.png"),
+                types.uint(RARITY_LEVELS.RARE),
+                types.ascii("weapon"),
+                types.uint(400),
+                types.bool(true) // tradable
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u1)");
+        
+        // Verify initial ownership and inventory
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-owner", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result.includes(wallet1.address), true);
+        
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-user-token-count", [types.principal(wallet1.address)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result, "u1");
+        
+        // Execute transfer from wallet1 to wallet2
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "transfer", [
+                types.uint(1),
+                types.principal(wallet1.address),
+                types.principal(wallet2.address)
+            ], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok true)");
+        
+        // Verify ownership changed
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-owner", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result.includes(wallet2.address), true);
+        
+        // Verify inventory updated correctly
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-user-token-count", [types.principal(wallet1.address)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result, "u0");
+        
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-user-token-count", [types.principal(wallet2.address)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result, "u1");
+    },
+});
+
+Clarinet.test({
+    name: "NFT transfer - validation and error handling",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        const wallet2 = accounts.get("wallet_2")!;
+        const wallet3 = accounts.get("wallet_3")!;
+        
+        // Mint a non-tradable item
+        let block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Soulbound Item"),
+                types.utf8("Cannot be transferred"),
+                types.utf8("https://example.com/soulbound.png"),
+                types.uint(RARITY_LEVELS.LEGENDARY),
+                types.ascii("artifact"),
+                types.uint(1800),
+                types.bool(false) // not tradable
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u1)");
+        
+        // Try to transfer non-tradable item - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "transfer", [
+                types.uint(1),
+                types.principal(wallet1.address),
+                types.principal(wallet2.address)
+            ], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u106)"); // err-not-tradable
+        
+        // Mint a tradable item for further tests
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Tradable Shield"),
+                types.utf8("Can be transferred"),
+                types.utf8("https://example.com/shield.png"),
+                types.uint(RARITY_LEVELS.UNCOMMON),
+                types.ascii("armor"),
+                types.uint(200),
+                types.bool(true) // tradable
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u2)");
+        
+        // Try to transfer item you don't own - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "transfer", [
+                types.uint(2),
+                types.principal(wallet1.address),
+                types.principal(wallet3.address)
+            ], wallet2.address) // wallet2 trying to transfer wallet1's item
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u105)"); // err-unauthorized
+        
+        // Try to transfer non-existent token - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "transfer", [
+                types.uint(999),
+                types.principal(wallet1.address),
+                types.principal(wallet2.address)
+            ], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u101)"); // err-not-found
+    },
+});
+
+Clarinet.test({
+    name: "NFT burning - successful burn and cleanup",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        
+        // Mint an item to burn
+        let block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Disposable Item"),
+                types.utf8("This item will be burned"),
+                types.utf8("https://example.com/disposable.png"),
+                types.uint(RARITY_LEVELS.COMMON),
+                types.ascii("consumable"),
+                types.uint(50),
+                types.bool(true)
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u1)");
+        
+        // Verify item exists and user has it
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-owner", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result.includes(wallet1.address), true);
+        
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-user-token-count", [types.principal(wallet1.address)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result, "u1");
+        
+        // Burn the item
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "burn", [types.uint(1)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok true)");
+        
+        // Verify item no longer exists
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-owner", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result, "(ok none)");
+        
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-token-metadata", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result, "none");
+        
+        // Verify inventory updated
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-user-token-count", [types.principal(wallet1.address)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result, "u0");
+    },
+});
+
+Clarinet.test({
+    name: "NFT burning - access control validation",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        const wallet2 = accounts.get("wallet_2")!;
+        
+        // Mint an item to wallet1
+        let block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Protected Item"),
+                types.utf8("This item should be protected from unauthorized burning"),
+                types.utf8("https://example.com/protected.png"),
+                types.uint(RARITY_LEVELS.EPIC),
+                types.ascii("armor"),
+                types.uint(800),
+                types.bool(true)
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u1)");
+        
+        // Try to burn item as non-owner - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "burn", [types.uint(1)], wallet2.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u105)"); // err-unauthorized
+        
+        // Try to burn non-existent item - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "burn", [types.uint(999)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u101)"); // err-not-found
+        
+        // Verify original item still exists
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-owner", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result.includes(wallet1.address), true);
+    },
+});
+
+Clarinet.test({
+    name: "Item upgrade - successful power level upgrades",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        
+        // Mint an upgradeable item
+        let block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Upgradeable Sword"),
+                types.utf8("This sword can be upgraded"),
+                types.utf8("https://example.com/upgradesword.png"),
+                types.uint(RARITY_LEVELS.RARE), // max power 500
+                types.ascii("weapon"),
+                types.uint(300), // starting power
+                types.bool(true)
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u1)");
+        
+        // Test is-item-upgradeable function
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "is-item-upgradeable", [types.uint(1), types.uint(400)], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "true");
+        
+        // Upgrade the item successfully
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "upgrade-item", [types.uint(1), types.uint(450)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok true)");
+        
+        // Verify upgrade applied
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-token-metadata", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.includes("u450"), true);
+        
+        // Test get-item-stats function
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-item-stats", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.includes("power-level: u450"), true);
+        assertEquals(block.receipts[0].result.includes("max-power: u500"), true);
+    },
+});
+
+Clarinet.test({
+    name: "Item upgrade - validation and error handling",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        const wallet2 = accounts.get("wallet_2")!;
+        
+        // Mint an item for upgrade testing
+        let block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Test Upgrade Item"),
+                types.utf8("For testing upgrade validation"),
+                types.utf8("https://example.com/testupgrade.png"),
+                types.uint(RARITY_LEVELS.UNCOMMON), // max power 250
+                types.ascii("weapon"),
+                types.uint(200), // starting power
+                types.bool(true)
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u1)");
+        
+        // Try to upgrade with same or lower power - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "upgrade-item", [types.uint(1), types.uint(200)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u107)"); // err-invalid-upgrade
+        
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "upgrade-item", [types.uint(1), types.uint(150)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u107)"); // err-invalid-upgrade
+        
+        // Try to upgrade beyond max power for rarity - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "upgrade-item", [types.uint(1), types.uint(300)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u108)"); // err-power-too-high
+        
+        // Try to upgrade item you don't own - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "upgrade-item", [types.uint(1), types.uint(230)], wallet2.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u105)"); // err-unauthorized
+        
+        // Try to upgrade non-existent item - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "upgrade-item", [types.uint(999), types.uint(100)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u101)"); // err-not-found
+    },
+});
+
+Clarinet.test({
+    name: "Item tradability - toggle tradable status",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        const wallet2 = accounts.get("wallet_2")!;
+        
+        // Mint a tradable item
+        let block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "mint-item", [
+                types.principal(wallet1.address),
+                types.ascii("Tradability Test Item"),
+                types.utf8("For testing tradability controls"),
+                types.utf8("https://example.com/tradabilitytest.png"),
+                types.uint(RARITY_LEVELS.COMMON),
+                types.ascii("misc"),
+                types.uint(50),
+                types.bool(true) // initially tradable
+            ], deployer.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok u1)");
+        
+        // Verify initial tradability
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-token-metadata", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result.includes("tradable: true"), true);
+        
+        // Toggle tradability to false
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-item-tradability", [types.uint(1), types.bool(false)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok true)");
+        
+        // Verify tradability changed
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "get-token-metadata", [types.uint(1)], deployer.address)
+        ]);
+        assertEquals(block.receipts[0].result.includes("tradable: false"), true);
+        
+        // Try to transfer now non-tradable item - should fail
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "transfer", [
+                types.uint(1),
+                types.principal(wallet1.address),
+                types.principal(wallet2.address)
+            ], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(err u106)"); // err-not-tradable
+        
+        // Toggle back to tradable
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-item-tradability", [types.uint(1), types.bool(true)], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok true)");
+        
+        // Now transfer should work
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "transfer", [
+                types.uint(1),
+                types.principal(wallet1.address),
+                types.principal(wallet2.address)
+            ], wallet1.address)
+        ]);
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result, "(ok true)");
+    },
+});
